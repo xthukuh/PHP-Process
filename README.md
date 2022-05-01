@@ -3,29 +3,35 @@
 This is a simple php ``proc_open`` wrapper class. Supports running background process on windows/linux, get child process pid buffer output among other functions.
 
 # Package
+Installation
+- ``composer require xthukuh/process``
 
 Minimum requirements:
-- PHP >= 5.3.0
-- [Composer](https://getcomposer.org/download/)
+- PHP Version >= 5.3.0
+- Requires [Composer](https://getcomposer.org/download/)
 
-Include the package within your project requirements:
-- ``composer install xthukuh/process``
-- ``composer dump-autoload``
+# Project
+
+You can fork and add improvements.
+
+- ``git clone https://github.com/xthukuh/process.git``
+- ``composer install``
+- ``./vendor/bin/phpunit tests --testdox``
 
 # Usage
 
 After the package has been installed...
 - ``use xthukuh\Process``;
-- [Read the _**Process**_ class commented documentation.](../../tree/main/src/Process.php)
-- [Example _**ProcessTest**_ implementation.](../../tree/main/tests/Feature/ProcessTest.php)
-- [Example with _**require_once**_.](../../tree/main/example.php)
+- [Process test example (_autoload_).](../../tree/main/tests/Feature/ProcessTest.php)
+- [Process example (_include_).](../../tree/main/example.php)
+- [Process background example (_include_).](../../tree/main/example.php)
 
 ```php
 <?php
 
 namespace App;
 
-use xthukuh\Process
+use xthukuh\Process;
 
 ## example process command (platform specific ping implementation)
 $cmd = Process::is_win() ? "ping 0 -n 5" : "ping 0 -c 5";
@@ -106,57 +112,6 @@ Process::buffer($pipe, $callback, array $options, int &$abort, string &$error);
 ```
 
 **NOTE: [Read Inline documentation to find out more about each method and its parameters.](../../tree/main/src/Process.php)**
-
-```php
-<?php
-header('content-type: text/plain');
-
-require_once __DIR__ . '/src/Process.php';
-
-use xthukuh\Process;
-
-$proc = new Process($cmd = sprintf('%s --version', Process::is_win() ? 'php' : '/usr/local/bin/php'), [
-	'cwd' => __DIR__,
-]);
-
-$output = null;
-$success = $proc -> open($background=false, $callback=function(Process $self) use (&$output){
-	$self -> output($callback=function(string $buffer) use (&$output){
-		if (is_null($output)) $output = '';
-		$output .= $buffer;
-	});
-});
-
-if ($success){
-	print(sprintf("process successful: pid=%s, exit=%s, output=\n--------------------\n%s\n--------------------\n", $proc -> pid, $proc -> exit, $output));
-	exit(0);
-}
-else {
-	print(sprintf("process failure: error='%s'\n", $proc -> error));
-	exit(1);
-}
-
-/*
-PS C:\www\process> php example.php
-process successful: pid=10956, exit=0, output=
---------------------
-PHP 7.3.31 (cli) (built: Sep 21 2021 12:17:30) ( ZTS MSVC15 (Visual C++ 2017) x64 )
-Copyright (c) 1997-2018 The PHP Group
-Zend Engine v3.3.31, Copyright (c) 1998-2018 Zend Technologies
-
---------------------
-*/
-```
-
-#
-
-# Project
-
-You can fork and add improvements.
-
-- ``git clone https://github.com/xthukuh/process.git``
-- ``composer install``
-- ``./vendor/bin/phpunit tests --testdox``
 
 #
 

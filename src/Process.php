@@ -13,6 +13,8 @@ class Process
 	 */
 	protected $default_options = [
 		'cwd' => null,              //string proc_open working directory (proc_open: $cwd).
+		'getcwd' => true,           //use getcwd as default cwd.
+		'realpath' => true,         //evaluate cwd realpath.
 		'descriptor_spec' => null,  //array file descriptors (see $default_descriptor_spec doc).
 		'env_vars' => null,         //array environment variables (proc_open: $env_vars).
 		'other_options' => null,    //array other options (see $default_win_options doc).
@@ -186,23 +188,31 @@ class Process
 	public function __construct(string $cmd=null, array $options=null){
 		$this -> _id = static::uid();
 		$this -> _cmd = is_string($cmd) && ($cmd = trim(str_replace(urldecode('%C2%A0'), ' ', $cmd))) ? $cmd : null;
-		$opts = []; $key = $val = null;
+		$key = $val = null;
+		$opts = ['descriptor_spec' => $this -> default_descriptor_spec];
 		if (is_array($options) && !empty($options)){
 			if (isset($options[$key = 'interactive']) && $options[$key]) $opts[$key] = true;
-			if (isset($options[$key = 'cwd']) && is_string($val = $options[$key]) && ($val = trim($val)) && file_exists($val) && is_dir($val)) $opts[$key] = $val;
+			if (isset($options[$key = 'cwd']) && is_string($val = $options[$key]) && ($val = trim($val))) $opts[$key] = $val;
+			if (isset($options[$key = 'getcwd'])) $opts[$key] = (bool) $options[$key];
+			if (isset($options[$key = 'realpath'])) $opts[$key] = (bool) $options[$key];
 			if (isset($options[$key = 'descriptor_spec']) && is_array($val = $options[$key])){
 				$tmp = []; $item = null;
 				foreach ($val as $item){
 					if (is_array($item) && !empty($item)) $tmp[] = $item;
 				}
-				if (!empty($tmp)) $opts[$key] = array_replace($this -> default_descriptor_spec, $tmp);
+				if (!empty($tmp)) $opts[$key] = array_replace($opts[$key], $tmp);
 				unset($item, $tmp);
 			}
 			if (isset($options[$key = 'env_vars']) && is_array($val = $options[$key]) && !empty($val)) $opts[$key] = $val;
 			if (isset($options[$key = 'other_options']) && is_array($val = $options[$key]) && !empty($val)) $opts[$key] = $val;
 		}
 		$this -> _options = array_replace($this -> default_options, $opts);
-		$this -> _cwd = isset($this -> _options[$key = 'cwd']) && ($val = trim($this -> _options[$key])) ? $val : null;
+		if (
+			isset($this -> _options[$key = 'cwd']) &&
+			($val = isset($this -> _options['realpath']) && $this -> _options['realpath'] ? realpath($this -> _options[$key]) : trim($this -> _options[$key])) &&
+			file_exists($val) && is_dir($val)
+		) $this -> _cwd = $val;
+		else $this -> _cwd = isset($this -> _options[$key = 'getcwd']) && $this -> _options[$key] ? getcwd() : null;
 		$this -> _key = $this -> _cmd ? md5($this -> _cmd . '-' . $this -> _cwd) : null;
 		unset($opts, $key, $val);
 		$this -> reset();
@@ -248,69 +258,114 @@ class Process
 	/**
 	 * Parse cmd string.
 	 * 
-	 * @param  string  $cmd
-	 * @param  string  $stdout
-	 * @param  string  $stderr
-	 * @return string  (process_cmd)
+	 * - Normalizes process command line format.
+	 * - result array [
+	 *    'cmd' => null,     //(string) parsed command line string
+	 *    'cmd_bg' => null,  //(string) parsed command line (to run in background)
+	 *    'stdout' => null,  //(string) parsed command redirect stdout path
+	 *    'stderr' => null,  //(string) parsed command redirect stderr path
+	 *    'stderr_merge' => false,  //(bool) whether command has 2>&1
+	 * ];
+	 * 
+	 * @param  string  $cmd  - Command line string.
+	 * @param  bool    $win  - Parse results for windows platform.
+	 * @return array
 	 */
-	private function parse(string $cmd){
-		static $_get_output;
-		$a = 0;
-		$e = 0;
+	private function parse(string $cmd, bool $win=false){
+		static $_get_output, $_quote_restore;
 		$s = trim($cmd);
-		if (preg_match('/(1| )\>\>/', $s)) $a = 1;
-		if (preg_match('/2\>\>/', $s)) $e = 1;
-		$s = preg_replace('/\>+/', '>', $s);
-		$s = preg_replace('/([^\>]+\=[12])\>/', '$1 >', $s);
-		$s = preg_replace('/([^12]+)\>/', '$1-1>', $s, 1);
-		$s = preg_replace('/([^12]+)\>/', '$1-2>', $s, 1);
-		$s = preg_replace('/-([12])\>/', '$1>', $s, 1);
-		$s = preg_replace('/&([12])\>/', '$1>', $s);
-		$s = preg_replace('/([^\>]+)([12])\>/', '$1 $2>', $s);
-		$s = preg_replace('/"([^"]+)"/', '$1', $s);
-		$s = preg_replace('/\'([^\']+)\'/', '$1', $s);
-		$s = preg_replace('/[ ]+/', ' ', $s);
-		$s = preg_replace('/\s*&([12])/', '&$1', $s);
-		$merge = 0;
-		if (strpos($s, '2>&1') !== false){
-			$merge = 1;
-			$s = trim(str_replace('2>&1', '', $s));
+		$stdout = $stderr = $tmp = $stderr_merge = null;
+		$q = -1; $quote = [];
+		if (strpos($s, '\'') !== false || strpos($s, '"') !== false){
+			$s = preg_replace_callback('/\'([^\']+)\'/', function($match) use (&$quote, &$q){
+				$q ++;
+				$quote[$tmp = '__' . $q . '__'] = $match[0];
+				return $tmp;
+			}, $s);
+			$s = preg_replace_callback('/"([^"]+)"/', function($match) use (&$quote, &$q){
+				$q ++;
+				$quote[$tmp = '__' . $q . '__'] = $match[0];
+				return $tmp;
+			}, $s);
+			if (!$_quote_restore) $_quote_restore = function($str, $q, $quote){
+				$i = $key = null;
+				for ($i = $q; $i >= 0; $i --){
+					$key = '__' . $i . '__';
+					$str = str_replace($key, $quote[$key], $str);
+				}
+				unset($i, $key);
+				return $str;
+			};
 		}
-		if (!$_get_output) $_get_output = function($s, $err=0){
-			$a = $err ? 2 : 1;
-			$b = $err ? 1 : 2;
-			if (!(($p = strpos($s, "$a>")) !== false && ($p += 2))) return;
-			$x = ($x = strpos($s, "$b>", $p)) !== false ? $x : (($x = strpos($s, '>', $p)) !== false ? $x : -1);
-			$v = ($d = $x < 0 ? 0 : $x - $p) ? substr($s, $p, $d) : substr($s, $p);
-			if (!strlen($v = trim($v))) return null;
-			if (!preg_match(sprintf('/^[^%s]*$/', preg_quote('*?"<>|:&', '/')), $v)) return null;
-			if (in_array($v, ['nul', 'null', '/dev/null'])) return null;
-			return $v;
-		};
-		$stdout = $_get_output($s);
-		$stderr = $_get_output($s, 1);
-		$stdout = $stdout ? '1' . ($a ? '>>' : '>') . ' ' . $stdout : null;
-		$stderr = $stderr ? '2' . ($e ? '>>' : '>') . ' ' . $stderr : null;
-		$s = preg_match('/^(.+?(?=[0-9]*\>))/', $s, $matches) && count($matches) ? trim($matches[0]) : trim($s);
-		$is_win = static::is_win();
+		if (strpos($s, '>') !== false){
+			$stdout_append = 0;
+			$stderr_append = 0;
+			if (preg_match('/(1| )\>\>/', $s)) $stdout_append = 1;
+			if (preg_match('/2\>\>/', $s)) $stderr_append = 1;
+			$s = preg_replace('/\>+/', '>', $s);
+			$s = preg_replace('/([^\>]+\=[12])\>/', '$1 >', $s);
+			$s = preg_replace('/([^12]+)\>/', '$1-1>', $s, 1);
+			$s = preg_replace('/([^12]+)\>/', '$1-2>', $s, 1);
+			$s = preg_replace('/-([12])\>/', '$1>', $s, 1);
+			$s = preg_replace('/&([12])\>/', '$1>', $s);
+			$s = preg_replace('/([^\>]+)([12])\>/', '$1 $2>', $s);
+			$s = preg_replace('/[ ]+/', ' ', $s);
+			$s = preg_replace('/\s*&([12])/', '&$1', $s);
+			if (strpos($s, '2>&1') !== false){
+				$stderr_merge = 1;
+				$s = trim(str_replace('2>&1', '', $s));
+			}
+			if (!$_get_output) $_get_output = function($s, $w, $e=0){
+				$a = $e ? 2 : 1;
+				$b = $e ? 1 : 2;
+				$p = $x = $d = $v = null;
+				if (!(($p = strpos($s, "$a>")) !== false && ($p += 2))) return;
+				if (($p = strpos($s, "$a>")) !== false && ($p += 2)){
+					$x = ($x = strpos($s, "$b>", $p)) !== false ? $x : (($x = strpos($s, '>', $p)) !== false ? $x : -1);
+					$v = ($d = $x < 0 ? 0 : $x - $p) ? substr($s, $p, $d) : substr($s, $p);
+					if (!strlen($v = trim($v))) $v = null;
+					elseif (!preg_match(sprintf('/^[^%s]*$/', preg_quote('*?"<>|:&', '/')), $v)) $v = null;
+					elseif (in_array(strtolower($v), ['nul', 'null', '/dev/null'])) $v = $w ? 'nul' : '/dev/null';
+				}
+				unset($a, $b, $p, $x, $d);
+				return $v;
+			};
+			$stdout = ($tmp = $_get_output($s, $win)) ? '' . ($stdout_append ? '>>' : '>') . $tmp : null;
+			$stderr = ($tmp = $_get_output($s, $win, 1)) ? '2' . ($stderr_append ? '>>' : '>') . $tmp : null;
+			unset($stdout_append, $stderr_append);
+			$s = preg_match('/^(.+?(?=[0-9]*\>))/', $s, $matches) && count($matches) ? trim($matches[0]) : trim($s);
+		}
+		if ($q > -1 && !empty($quote) && $_quote_restore){
+			$s = $_quote_restore($s, $q, $quote);
+			if ($stdout) $stdout = $_quote_restore($stdout, $q, $quote);
+			if ($stderr) $stderr = $_quote_restore($stderr, $q, $quote);
+		}
 		$bg = $s;
-		if ($stdout) $bg .= ' ' . $stdout;
-		else $bg .= ' > ' . ($is_win ? 'nul' : '/dev/null');
-		if ($stderr) $bg .= ' ' . $stderr;
-		elseif ($merge) $bg .= ' 2>&1';
-		else $bg .= ($is_win ? ' 2>nul' : ' 2>/dev/null');
-		if (preg_match($p = '/^(start\s*(\/b)?)((?![a-z]).+)$/i', $bg)){
-			$bg = preg_replace($p, '$3', $bg);
-			$bg = trim(preg_replace('/\s+/', ' ', $bg));
+		if ($stdout){
+			$s .= ($tmp = ' ' . $stdout);
+			$bg .= $tmp;
 		}
-		if ($is_win) $bg = 'start /b ' . $bg . ' &';
+		else $bg .= ' >' . ($win ? 'nul' : '/dev/null');
+		if ($stderr){
+			$s .= ($tmp = ' ' . $stderr);
+			$bg .= $tmp;
+		}
+		else {
+			$s .= $stderr_merge ? ' 2>&1' : '';
+			$bg .= ' 2>' . ($stderr_merge ? '&1' : ($win ? 'nul' : '/dev/null'));
+		}
+		if ($win){
+			if (preg_match($tmp = '/^(start\s*(\/b)?)((?![a-z]).+)$/i', $bg)) $bg = trim(preg_replace('/\s+/', ' ', preg_replace($tmp, '$3', $bg)));
+			$bg = 'start /b ' . $bg . ' &';
+		}
 		else $bg .= ' & echo $!';
+		unset($tmp, $q, $quote);
 		return [
-			'bg' => $bg,
 			'cmd' => $s,
+			'cmd_bg' => $bg,
 			'stdout' => $stdout,
 			'stderr' => $stderr,
-			'merge' => $merge,
+			'stderr_merge' => (bool) $stderr_merge,
 		];
 	}
 
@@ -319,55 +374,50 @@ class Process
 	 * 
 	 * When running in background ($background = true):
 	 * - Child process continues running unless terminated/killed (even after default close [$this -> close()]).
-	 * - Custom option ['descriptor_spec' => [...]] is ignored.
-	 * - The command line string is formatted:
-	 *   ~ sprintf('start /b %s > nul 2>&1', $cmd)         - Windows (available pipes: [0 => stdout])
-	 *   ~ sprintf('%s > /dev/null 2>&1 & echo $!', $cmd)  - Unix/Linux (available pipes: [0 => stdout, 1 => stdout, 2 => stderr])
-	 * - Output buffer is not available except on Unix/Linux where output is child process pid.
-	 * - AVOID using format strings within your process command: (start /b ... > nul 2>&1) or (... > /dev/null 2>&1 & echo &!).
+	 * - Windows only has available pipe: [0 => stdin] (non-blocking not supported).
+	 *   Custom option ['descriptor_spec' => [...]] is ignored.
+	 * - The command line string is formatted with "start /b ... >nul 2>&1 &" (Windows) or "... >/dev/null 2>&1 & echo &!" (Linux/Unix).
+	 *   Avoid using "start /b ... &" or "... & echo &!" in your command.
+	 * - Unix/Linux output buffer is the child process pid.
+	 *   No need to get output buffer (use $this -> cpid).
 	 * 
 	 * When callback is callable ($callback(Process $this)):
 	 * - Callback is called after successful process open.
-	 * - Shutdown listener is registered.
-	 * - If callback returns true   - process is kept open (to be closed manually).
-	 * - If callback returns false  - process is terminated.
-	 * - Otherwise, process is closed by default.
+	 * - Shutdown listener is registered before call (shutdown kills unclosed instance).
+	 * - If callback returns false;     - process is terminated/killed.
+	 * - Else If callback returns true; - process is kept open (to be closed manually).
+	 * - Else; - process is closed by default ($this -> close()).
 	 * 
 	 * @param  bool      $background  - Enable running in background.
 	 * @param  callable  $callback    - Closure/Method open callback [Process $this].
 	 * @return bool
 	 */
 	public function open(bool $background=false, $callback=null){
-		$background = (bool) $background;
-		$callback = is_callable($callback) ? $callback : null;
-		
+		static $_failure;
 		$this -> reset();
-		
-		$cmd = null;
-		$_failure = function($err, $reset=1) use (&$background, &$cmd){
+		$this -> _background = (bool) $background;
+		$callback = is_callable($callback) ? $callback : null;
+		if (!$_failure) $_failure = function($err, $reset=1){
+			$err = sprintf('Open%s process %s. (cmd: %s)', $this -> _background ? ' background' : '', $err, $this -> _ccmd);
 			if ($reset) $this -> reset();
-			$this -> _error = sprintf('Open%s process %s. (cmd: %s)', $background ? ' background' : '', $err, $cmd);
+			$this -> _error = $err;
 			return false;
 		};
 		
 		if (!($cmd = $this -> _cmd)) return $_failure('cmd is undefined', 0);
-		
-		$options = is_array($options = $this -> _options) ? $options : $this -> default_options;
-		$this -> _cwd = isset($options[$key = 'cwd']) && ($val = trim($options[$key])) && file_exists($val) && is_dir($val) ? $val : getcwd();
-		$this -> _descriptor_spec = isset($options[$key = 'descriptor_spec']) && is_array($val = $options[$key]) && count($val) === 3 ? $val : $this -> default_descriptor_spec;
-		$this -> _env_vars = isset($options[$key = 'env_vars']) && is_array($val = $options[$key]) && !empty($val) ? $val : null;
-		$this -> _other_options = isset($options[$key = 'other_options']) && is_array($val = $options[$key]) && !empty($val) ? $val : null;
+		if (!is_array($this -> _options)) return $_failure('options are undefined', 0);
 		
 		$is_win = static::is_win();
-		
-		if ($background){
-			$parse = $this -> parse($cmd);
-			$cmd = $parse['bg'];
-			unset($parse);
+		$parse = $this -> parse($cmd, $is_win);
+		$this -> _ccmd = $parse['cmd'];
+		$this -> _env_vars = $this -> _options['env_vars'];
+		$this -> _other_options = $this -> _options['other_options'];
+		$this -> _descriptor_spec = $this -> _options['descriptor_spec'];
+		if ($this -> _background){
+			$this -> _ccmd = $parse['cmd_bg'];
 			if ($is_win) $this -> _descriptor_spec = array_slice($this -> default_descriptor_spec, 0, 1);
 		}
-
-		$this -> _ccmd = $cmd;
+		unset($parse);
 		
 		$this -> _process = proc_open(
 			$this -> _ccmd,
@@ -377,17 +427,16 @@ class Process
 			$this -> _env_vars,
 			$this -> _other_options
 		);
-
-		if (!is_resource($this -> _process)) return $_failure('failure');
 		
+		if (!is_resource($this -> _process)) return $_failure('failure');
 		$this -> _open = true;
 		
 		if (!(is_array($this -> _pipes) && count($this -> _pipes))) return $_failure('has invalid resource pipes');
-		if (!(!empty($this -> status($pid)) && $pid)) return $_failure('get status pid failure');
+		if (!(!empty($this -> status($pid, $running)) && $pid)) return $_failure('get status pid failure');
 
 		$this -> _ppid = $pid;
 		
-		if ($background){
+		if ($this -> _background){
 			if (!($pid = static::child($pid))) return $_failure('[' . $this -> _ppid . '] get child pid failure');
 			$this -> _background = $background;
 			$this -> _cpid = $pid;
@@ -405,7 +454,6 @@ class Process
 				return $_failure('callback exception: ' . $e -> getMessage());
 			}
 		}
-
 		if ($res === false) $this -> close(1, $this -> _pid);
 		elseif ($res !== true) $this -> close();
 
@@ -428,7 +476,6 @@ class Process
 			if (!(is_integer($kill_pid) && $kill_pid > 0)) $kill_pid = $this -> _pid;
 			static::kill($kill_pid);
 		}
-		if ($running && is_resource($this -> _process)) proc_terminate($this -> _process);
 		if (is_array($this -> _pipes)){
 			foreach ($this -> _pipes as &$pipe){
 				if (is_resource($pipe)) fclose($pipe);
@@ -669,26 +716,26 @@ class Process
 	/**
 	 * Buffer listener (fgets).
 	 * 
-	 * Callback is called with argument: [string $buffer]
+	 * - Callback is called with argument: [string $buffer]
 	 * 
-	 * Config $options = [
-	 *     'print' => 0,           - int print output buffer mode (0 = disabled, 1 = print only, 2 = ob_end_flush, ob_implicit_flush, print, 3 = ob_end_clean, ob_implicit_flush, print).
-	 *     'pid' => null,          - int process pid (if read fails, aborts if is not running).
-	 *     'seek' => null,         - int fseek offset.
-	 *     'length' => 1024,       - int fgets length.
-	 *     'delay_ms' => 500,      - int read loop delay milliseconds (used on read retry or seekable resource).
-	 *     'fgets_timeout' => 5,   - float fgets socket timeout (seconds).
-	 *     'retry_timeout' => 10,  - float read retry timeout (seconds).
+	 * - Options config = [
+	 *   'print' => 0,           - int print output buffer mode (0 = disabled, 1 = print only, 2 = ob_end_flush, ob_implicit_flush, print, 3 = ob_end_clean, ob_implicit_flush, print).
+	 *   'pid' => null,          - int process pid (if read fails, aborts if is not running).
+	 *   'seek' => null,         - int fseek offset.
+	 *   'length' => 1024,       - int fgets length.
+	 *   'delay_ms' => 500,      - int read loop delay milliseconds (used on read retry or seekable resource).
+	 *   'fgets_timeout' => 5,   - float fgets socket timeout (seconds).
+	 *   'retry_timeout' => 10,  - float read retry timeout (seconds).
 	 * ];
 	 * 
-	 * Abort values/reasons:
-	 *   $abort = null - Read failure.
-	 *   $abort = -3   - Read retry timed out.
-	 *   $abort = -2   - Process closed (if options pid is provided).
-	 *   $abort = -1   - Connection aborted.
-	 *   $abort = 0    - Read (fgets) returned false.
-	 *   $abort = 1    - Read (fgets) returned empty string.
-	 *   $abort = 2    - Callback returned false.
+	 * - Abort values/reasons:
+	 * ~ $abort = null - Read failure.
+	 * ~ $abort = -3   - Read retry timed out.
+	 * ~ $abort = -2   - Process closed (if options pid is provided).
+	 * ~ $abort = -1   - Connection aborted.
+	 * ~ $abort = 0    - Read (fgets) returned false.
+	 * ~ $abort = 1    - Read (fgets) returned empty string.
+	 * ~ $abort = 2    - Callback returned false.
 	 * 
 	 * @param  mixed     $pipe      - Stream resource handle | String file path.
 	 * @param  callable  $callback  - Closure/Method buffer callback.

@@ -5,9 +5,7 @@ require_once __DIR__ . '/src/Process.php';
 
 use xthukuh\Process;
 
-$proc = new Process($cmd = sprintf('%s --version', Process::is_win() ? 'php' : '/usr/local/bin/php'), [
-	'cwd' => __DIR__,
-]);
+$proc = new Process($cmd = sprintf('%s --version', Process::is_win() ? 'php' : '/usr/local/bin/php'));
 
 $output = null;
 $success = $proc -> open($background=false, $callback=function(Process $self) use (&$output){
@@ -25,12 +23,15 @@ else {
 	print(sprintf("process failure: error='%s'\n", $proc -> error));
 	exit(1);
 }
+
 /*
-process successful: pid=1152, exit=0, output=
+PS C:\www\process> php example.php
+process successful: pid=10956, exit=0, output=
 --------------------
 PHP 7.3.31 (cli) (built: Sep 21 2021 12:17:30) ( ZTS MSVC15 (Visual C++ 2017) x64 )
 Copyright (c) 1997-2018 The PHP Group
 Zend Engine v3.3.31, Copyright (c) 1998-2018 Zend Technologies
 
 --------------------
+PS C:\www\process>
 */
